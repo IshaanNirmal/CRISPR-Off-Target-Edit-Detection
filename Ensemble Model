@@ -1,0 +1,698 @@
+import pandas as pd
+df = pd.read_csv(data_path)
+df.head()
+
+df_guide_seq = df[df['Method'] == 'GUIDE-seq']
+df_no_guide_seq = df[df['Method'] != 'GUIDE-seq']
+
+
+print(f"Shape of df_guide_seq: {df_guide_seq.shape}")
+print(f"Shape of df_no_guide_seq: {df_no_guide_seq.shape}")
+
+df_guide_seq_pos = df_guide_seq[df_guide_seq['label'] == 1]
+df_guide_seq_neg = df_guide_seq[df_guide_seq['label'] == 0]
+
+
+# Number of positive samples
+num_pos_samples = len(df_guide_seq_pos)
+
+
+# Number of negative samples to select (5 for each positive sample)
+num_neg_samples_to_select = num_pos_samples * 5
+
+
+# Randomly select negative samples
+df_guide_seq_neg_sampled = df_guide_seq_neg.sample(n=num_neg_samples_to_select, random_state=67, replace=True)
+
+
+# Combine positive samples and sampled negative samples
+df_guide_sampled = pd.concat([df_guide_seq_pos, df_guide_seq_neg_sampled])
+
+
+# Shuffle the new dataset
+df_guide_sampled = df_guide_sampled.sample(frac=1, random_state=67).reset_index(drop=True)
+
+
+print(f"Shape of the new sampled dataset: {df_guide_sampled.shape}")
+print("Head of the new sampled dataset:")
+display(df_guide_sampled.head())
+
+
+print(f"Number of positive samples in df_guide_sampled: {len(df_guide_sampled[df_guide_sampled['label'] == 1])}")
+print(f"Number of negative samples in df_guide_sampled: {len(df_guide_sampled[df_guide_sampled['label'] == 0])}")
+
+df_no_guide_seq_pos = df_no_guide_seq[df_no_guide_seq['label'] == 1]
+df_no_guide_seq_neg = df_no_guide_seq[df_no_guide_seq['label'] == 0]
+
+
+# Number of positive samples
+num_pos_samples2 = len(df_no_guide_seq_pos)
+
+
+# Number of negative samples to select (5 for each positive sample)
+num_neg_samples_to_select2 = num_pos_samples2 * 5
+
+
+# Randomly select negative samples
+df_no_guide_seq_neg_sampled = df_no_guide_seq_neg.sample(n=num_neg_samples_to_select2, random_state=42, replace=True)
+
+
+# Combine positive samples and sampled negative samples
+df_no_guide_sampled = pd.concat([df_no_guide_seq_pos, df_no_guide_seq_neg_sampled])
+
+
+# Shuffle the new dataset
+df_no_guide_sampled = df_no_guide_sampled.sample(frac=1, random_state=42).reset_index(drop=True)
+
+
+print(f"Shape of the new sampled dataset: {df_no_guide_sampled.shape}")
+print("Head of the new sampled dataset:")
+display(df_no_guide_sampled.head())
+
+
+print(f"Number of positive samples in df_no_guide_sampled: {len(df_no_guide_sampled[df_no_guide_sampled['label'] == 1])}")
+print(f"Number of negative samples in df_no_guide_sampled: {len(df_no_guide_sampled[df_no_guide_sampled['label'] == 0])}")
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModel
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score, f1_score, roc_curve, auc, precision_recall_curve, average_precision_score, confusion_matrix, precision_score, recall_score
+import numpy as np, random
+import matplotlib.pyplot as plt
+import joblib # Import joblib for saving predictions
+from torch.optim.lr_scheduler import StepLR # Import StepLR
+import seaborn as sns # Import seaborn for heatmap
+from sklearn.utils import resample # For bootstrapping
+from scipy.interpolate import interp1d # For curve interpolation
+
+
+# ==== CONFIG ====
+MODEL_NAME = "distilbert-base-uncased"
+MAX_LEN = 128
+BATCH_SIZE = 32
+EPOCHS = 50
+LR = 2e-5
+WEIGHT_DECAY = 0.01
+DROPOUT = 0.2
+SEED = 42
+FOCAL_ALPHA = 0.75 # Adjusted alpha for imbalanced dataset
+FOCAL_GAMMA = 2.0
+GRAD_CLIP = 1.0
+EARLY_STOP_PATIENCE = 3
+LR_DECAY_STEP = 2 # Step size for learning rate decay
+LR_DECAY_GAMMA = 0.5 # Decay rate for learning rate
+N_BOOTSTRAPS = 1000 # Number of bootstraps for CI calculation
+CONF_ALPHA = 0.95 # Confidence level for CIs
+
+
+# ==== SEEDING ====
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+
+
+# ==== TOKENIZER (char-level trick for RNA) ====
+base_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+
+def char_space(seq):
+    # replace T with U and add spaces between characters
+    return " ".join(list(seq.replace("T", "U")))
+
+
+# ==== DATA SPLIT ====
+# Use df_no_guide_seq for training and validation, and df_guide_seq for testing
+trainval_df = df_no_guide_sampled.copy()
+test_df = df_guide_sampled.copy()
+
+
+# Split train/val (90%/10% of trainval_df)
+train_df, val_df = train_test_split(
+    trainval_df, test_size=0.1, stratify=trainval_df['label'], random_state=SEED
+)
+
+
+print(f"Train size: {len(train_df)}, Val size: {len(val_df)}, Test size: {len(test_df)})")
+
+
+# ==== BUILD CONCATENATED SEQUENCES ====
+def build_input(row):
+    return f"{row['sgRNA_seq']} | {row['off_seq']}"
+
+
+train_df['input_seq'] = train_df.apply(build_input, axis=1)
+val_df['input_seq']   = val_df.apply(build_input, axis=1)
+test_df['input_seq']  = test_df.apply(build_input, axis=1)
+
+
+# ==== CHAR-LEVEL PROCESSING ====
+train_df['proc_seq'] = train_df['input_seq'].apply(char_space)
+val_df['proc_seq']   = val_df['input_seq'].apply(char_space)
+test_df['proc_seq']  = test_df['input_seq'].apply(char_space)
+
+
+# ==== DATASET CLASS ====
+class RNADataset(Dataset):
+    def __init__(self, sequences, labels, tokenizer):
+        self.sequences = sequences
+        self.labels = labels
+        self.tok = tokenizer
+
+
+    def __len__(self):
+        return len(self.sequences)
+
+
+    def __getitem__(self, idx):
+        enc = self.tok(
+            self.sequences[idx],
+            padding='max_length',
+            truncation=True,
+            max_length=MAX_LEN,
+            return_tensors='pt'
+        )
+        return {
+            'input_ids': enc['input_ids'].squeeze(0),
+            'attention_mask': enc['attention_mask'].squeeze(0),
+            'labels': torch.tensor(self.labels[idx], dtype=torch.float)
+        }
+
+
+# ==== MODEL ====
+class Classifier(nn.Module):
+    def __init__(self, num_labels=1):
+        super().__init__()
+        self.encoder = AutoModel.from_pretrained(MODEL_NAME)
+        self.dropout = nn.Dropout(DROPOUT)
+        self.fc = nn.Linear(self.encoder.config.hidden_size, num_labels)
+
+
+    def forward(self, input_ids, attention_mask):
+        out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = out.last_hidden_state[:, 0]  # CLS token
+        x = self.dropout(pooled)
+        return self.fc(x).squeeze(-1)
+
+
+# ==== FOCAL LOSS ====
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1.0, gamma=2.0, weight=None):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.bce = nn.BCEWithLogitsLoss(reduction='none', weight=weight)
+
+
+    def forward(self, logits, labels):
+        bce = self.bce(logits, labels)
+        pt = torch.exp(-bce)
+        loss = self.alpha * (1-pt)**self.gamma * bce
+        return loss.mean()
+
+
+# ==== DATA LOADERS ====
+train_ds = RNADataset(train_df['proc_seq'].tolist(), train_df['label'].tolist(), base_tokenizer)
+val_ds   = RNADataset(val_df['proc_seq'].tolist(),   val_df['label'].tolist(),   base_tokenizer)
+test_ds  = RNADataset(test_df['proc_seq'].tolist(),  test_df['label'].tolist(),  base_tokenizer)
+
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE)
+test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE)
+
+
+# ==== TRAINING WITH VALIDATION + EARLY STOPPING ====
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+model = Classifier().to(device)
+
+
+# Calculate class weights for imbalanced dataset
+neg_count = len(train_df[train_df['label'] == 0])
+pos_count = len(train_df[train_df['label'] == 1])
+total_count = len(train_df)
+weight_for_0 = total_count / (2 * neg_count)
+weight_for_1 = total_count / (2 * pos_count)
+class_weights = torch.tensor([weight_for_0, weight_for_1], dtype=torch.float).to(device)
+
+
+criterion = FocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA, weight=class_weights[1]) # Use weight for positive class
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler = StepLR(optimizer, step_size=LR_DECAY_STEP, gamma=LR_DECAY_GAMMA) # Add learning rate scheduler
+scaler = torch.amp.GradScaler(enabled=torch.cuda.is_available()) # Updated for FutureWarning
+
+
+best_val_loss = float('inf')
+patience = 0
+
+
+train_losses = [] # List to store training losses
+val_losses = []   # List to store validation losses
+
+
+for epoch in range(EPOCHS):
+    # ---- Training ----
+    model.train()
+    total_loss = 0
+    for batch in train_loader:
+        ids = batch['input_ids'].to(device)
+        mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+
+
+        optimizer.zero_grad()
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=torch.cuda.is_available()): # Updated for FutureWarning
+            outputs = model(ids, mask)
+            loss = criterion(outputs, labels)
+        scaler.scale(loss).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        scaler.step(optimizer)
+        scaler.update()
+        total_loss += loss.item()
+
+
+    avg_train_loss = total_loss / len(train_loader)
+    train_losses.append(avg_train_loss)
+
+
+    # ---- Validation ----
+    model.eval()
+    val_loss, all_labels, all_preds = 0, [], []
+    with torch.no_grad():
+        for batch in val_loader:
+            ids = batch['input_ids'].to(device)
+            mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            outputs = model(ids, mask)
+            loss = criterion(outputs, labels)
+            val_loss += loss.item()
+
+
+            preds = (torch.sigmoid(outputs) > 0.5).int().cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().numpy())
+
+
+    avg_val_loss = val_loss / len(val_loader)
+    val_losses.append(avg_val_loss)
+
+
+    val_acc = accuracy_score(all_labels, all_preds)
+    val_f1 = f1_score(all_labels, all_preds)
+
+
+    print(f"Epoch {epoch+1}/{EPOCHS} | "
+          f"Train Loss: {avg_train_loss:.4f} | "
+          f"Val Loss: {avg_val_loss:.4f} | "
+          f"Val Acc: {val_acc:.4f} | "
+          f"Val F1: {val_f1:.4f}")
+
+
+    # ---- Early Stopping ----
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        patience = 0
+        torch.save(model.state_dict(), "best_model.pt") # Save best model weights
+    else:
+        patience += 1
+        if patience >= EARLY_STOP_PATIENCE:
+            print("Early stopping triggered.")
+            break
+
+
+    scheduler.step()
+
+
+# ==== PLOT TRAINING AND VALIDATION LOSS ====
+plt.figure(figsize=(10, 6))
+plt.plot(range(1, len(train_losses) + 1), train_losses, label='Train Loss')
+plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training and Validation Loss Curve')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+# ==== FINAL EVALUATION ON TEST SET ====
+# Load the best model weights
+model.load_state_dict(torch.load("best_model.pt"))
+model.eval()
+y_true, y_pred_raw = [], [] # Store raw logits for plotting curves
+with torch.no_grad():
+    for batch in test_loader:
+        ids = batch['input_ids'].to(device)
+        mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].cpu().numpy()
+        logits = model(ids, mask).cpu()
+        y_true.extend(labels)
+        y_pred_raw.extend(logits.numpy()) # Save raw logits
+
+
+# Convert to numpy arrays
+y_true = np.array(y_true)
+y_pred_raw = np.array(y_pred_raw)
+y_pred = (torch.sigmoid(torch.tensor(y_pred_raw)) > 0.5).int().numpy() # Convert raw logits to binary predictions
+
+
+# Save raw predictions and model weights
+joblib.dump(y_pred_raw, "test_predictions_raw.joblib")
+print("\nRaw test predictions saved as test_predictions_raw.joblib")
+torch.save(model.state_dict(), "final_model.pt") # Save final model weights
+print("Final model weights saved as final_model.pt")
+
+
+# ==== BOOTSTRAPPING FOR CONFIDENCE INTERVALS ====
+def bootstrap_confidence_intervals(y_true, y_pred_raw, n_bootstraps=N_BOOTSTRAPS, alpha=CONF_ALPHA):
+    bootstrapped_roc_aucs = []
+    bootstrapped_prc_aucs = []
+    bootstrapped_f1_scores = []
+    bootstrapped_accuracies = []
+    bootstrapped_precisions = [] # for positive class
+    bootstrapped_recalls = []    # for positive class
+
+
+    # For curves
+    tprs_list = []
+    precisions_list = []
+    # Use a common set of points for interpolation to combine curves
+    mean_fpr = np.linspace(0, 1, 100)
+    mean_recall_for_interp = np.linspace(0, 1, 100) # For PR curve interpolation
+
+
+    for i in range(n_bootstraps):
+        # Resample with replacement
+        indices = resample(np.arange(len(y_true)), replace=True, n_samples=len(y_true), random_state=i)
+        y_true_resampled = y_true[indices]
+        y_pred_raw_resampled = y_pred_raw[indices]
+
+
+        # Calculate ROC metrics
+        fpr, tpr, _ = roc_curve(y_true_resampled, y_pred_raw_resampled)
+        roc_auc = auc(fpr, tpr)
+        bootstrapped_roc_aucs.append(roc_auc)
+
+
+        # Interpolate TPRs to a common FPR grid for CI calculation
+        interp_tpr = interp1d(fpr, tpr, kind='linear', fill_value=(tpr[0], tpr[-1]), bounds_error=False)(mean_fpr)
+        tprs_list.append(interp_tpr)
+
+
+        # Calculate PR metrics
+        precision, recall, _ = precision_recall_curve(y_true_resampled, y_pred_raw_resampled)
+        prc_auc = average_precision_score(y_true_resampled, y_pred_raw_resampled)
+        bootstrapped_prc_aucs.append(prc_auc)
+
+
+        # Interpolate Precisions to a common Recall grid for CI calculation (reverse order for interpolation)
+        # Note: PR curves typically start high precision/low recall and move to low precision/high recall
+        # Interpolate based on sorted recall values
+        sorted_recall_indices = np.argsort(recall)
+        interp_precision = interp1d(recall[sorted_recall_indices], precision[sorted_recall_indices], kind='linear', fill_value=(precision[sorted_recall_indices[0]], precision[sorted_recall_indices[-1]]), bounds_error=False)(mean_recall_for_interp)
+        precisions_list.append(interp_precision)
+
+
+        # Calculate binary classification metrics
+        y_pred_resampled = (torch.sigmoid(torch.tensor(y_pred_raw_resampled)) > 0.5).int().numpy()
+        bootstrapped_f1_scores.append(f1_score(y_true_resampled, y_pred_resampled, zero_division=0))
+        bootstrapped_accuracies.append(accuracy_score(y_true_resampled, y_pred_resampled))
+        bootstrapped_precisions.append(precision_score(y_true_resampled, y_pred_resampled, zero_division=0))
+        bootstrapped_recalls.append(recall_score(y_true_resampled, y_pred_resampled, zero_division=0))
+
+
+    # Calculate CIs for metrics
+    lower_percentile = (1 - alpha) / 2 * 100
+    upper_percentile = (1 + alpha) / 2 * 100
+
+
+    roc_auc_ci = np.percentile(bootstrapped_roc_aucs, [lower_percentile, upper_percentile])
+    prc_auc_ci = np.percentile(bootstrapped_prc_aucs, [lower_percentile, upper_percentile])
+    f1_ci = np.percentile(bootstrapped_f1_scores, [lower_percentile, upper_percentile])
+    accuracy_ci = np.percentile(bootstrapped_accuracies, [lower_percentile, upper_percentile])
+    precision_pos_ci = np.percentile(bootstrapped_precisions, [lower_percentile, upper_percentile])
+    recall_pos_ci = np.percentile(bootstrapped_recalls, [lower_percentile, upper_percentile])
+
+
+    # Calculate CIs for curves
+    tprs_lower = np.percentile(tprs_list, lower_percentile, axis=0)
+    tprs_upper = np.percentile(tprs_list, upper_percentile, axis=0)
+
+
+    precisions_lower = np.percentile(precisions_list, lower_percentile, axis=0)
+    precisions_upper = np.percentile(precisions_list, upper_percentile, axis=0)
+
+
+    return {
+        'roc_auc_ci': roc_auc_ci,
+        'prc_auc_ci': prc_auc_ci,
+        'f1_ci': f1_ci,
+        'accuracy_ci': accuracy_ci,
+        'precision_pos_ci': precision_pos_ci,
+        'recall_pos_ci': recall_pos_ci,
+        'mean_fpr': mean_fpr,
+        'tprs_lower': tprs_lower,
+        'tprs_upper': tprs_upper,
+        'mean_recall_for_interp': mean_recall_for_interp,
+        'precisions_lower': precisions_lower,
+        'precisions_upper': precisions_upper,
+    }
+
+
+
+
+# ================================================
+#       Displaying Regular Metrics and Plots
+# ================================================
+
+
+print("\n=== Standard Test Set Performance Metrics ===")
+print(classification_report(y_true, y_pred, digits=4))
+
+
+# Calculate individual metrics for standard display
+std_accuracy = accuracy_score(y_true, y_pred)
+std_f1_pos = f1_score(y_true, y_pred, pos_label=1, zero_division=0)
+std_prec_pos = precision_score(y_true, y_pred, pos_label=1, zero_division=0)
+std_rec_pos = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
+std_auprc = average_precision_score(y_true, y_pred_raw)
+fpr, tpr, _ = roc_curve(y_true, y_pred_raw)
+std_roc_auc = auc(fpr, tpr)
+
+
+print(f"Accuracy: {std_accuracy:.4f}")
+print(f"F1-score (positive class): {std_f1_pos:.4f}")
+print(f"Precision (positive class): {std_prec_pos:.4f}")
+print(f"Recall (positive class): {std_rec_pos:.4f}")
+print(f"AUPRC: {std_auprc:.4f}")
+print(f"ROC AUC: {std_roc_auc:.4f}")
+
+
+# ==== Standard ROC Curve ====
+plt.figure(figsize=(8, 6))
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {std_roc_auc:.4f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic (ROC) Curve')
+plt.legend(loc="lower right")
+plt.grid(True)
+plt.show()
+
+
+# ==== Standard Precision-Recall Curve ====
+precision, recall, _ = precision_recall_curve(y_true, y_pred_raw)
+plt.figure(figsize=(8, 6))
+plt.plot(recall, precision, color='blue', lw=2, label=f'Precision-Recall curve (area = {std_auprc:.4f})')
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('Precision-Recall Curve')
+plt.legend(loc="lower left")
+plt.grid(True)
+plt.show()
+
+
+# ================================================
+#       Displaying Metrics and Plots with CIs
+# ================================================
+
+
+print(f"\nPerforming {N_BOOTSTRAPS} bootstraps for Confidence Interval calculation...")
+bootstrap_results = bootstrap_confidence_intervals(y_true, y_pred_raw)
+
+
+print("\n=== Performance Metrics with 95% Confidence Intervals ===")
+
+
+# Overall Accuracy with CI
+acc_ci = bootstrap_results['accuracy_ci']
+print(f"Accuracy: {accuracy_score(y_true, y_pred):.4f} (95% CI: {acc_ci[0]:.4f} - {acc_ci[1]:.4f})")
+
+
+# F1-score for positive class with CI
+f1_pos = f1_score(y_true, y_pred, pos_label=1, zero_division=0)
+f1_pos_ci = bootstrap_results['f1_ci']
+print(f"F1-score (positive class): {f1_pos:.4f} (95% CI: {f1_pos_ci[0]:.4f} - {f1_pos_ci[1]:.4f})")
+
+
+# Precision for positive class with CI
+prec_pos = precision_score(y_true, y_pred, pos_label=1, zero_division=0)
+prec_pos_ci = bootstrap_results['precision_pos_ci']
+print(f"Precision (positive class): {prec_pos:.4f} (95% CI: {prec_pos_ci[0]:.4f} - {prec_pos_ci[1]:.4f})")
+
+
+# Recall for positive class with CI
+rec_pos = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
+rec_pos_ci = bootstrap_results['recall_pos_ci']
+print(f"Recall (positive class): {rec_pos:.4f} (95% CI: {rec_pos_ci[0]:.4f} - {rec_pos_ci[1]:.4f})")
+
+
+# AUPRC with CI
+auprc = average_precision_score(y_true, y_pred_raw)
+auprc_ci = bootstrap_results['prc_auc_ci']
+print(f"AUPRC: {auprc:.4f} (95% CI: {auprc_ci[0]:.4f} - {auprc_ci[1]:.4f})")
+
+
+# ROC AUC with CI
+fpr, tpr, _ = roc_curve(y_true, y_pred_raw)
+roc_auc = auc(fpr, tpr)
+roc_auc_ci = bootstrap_results['roc_auc_ci']
+print(f"ROC AUC: {roc_auc:.4f} (95% CI: {roc_auc_ci[0]:.4f} - {roc_auc_ci[1]:.4f})")
+
+
+
+
+# ==== ROC Curve and AUC with CI ====
+plt.figure(figsize=(8, 6))
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.4f})')
+plt.fill_between(bootstrap_results['mean_fpr'], bootstrap_results['tprs_lower'], bootstrap_results['tprs_upper'], color='grey', alpha=0.3, label='95% CI')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic (ROC) Curve with 95% CI')
+plt.legend(loc="lower right")
+plt.grid(True)
+plt.show()
+
+
+
+
+# ==== Precision-Recall Curve and AUC with CI ====
+precision, recall, _ = precision_recall_curve(y_true, y_pred_raw)
+prc_auc = average_precision_score(y_true, y_pred_raw) # PRC AUC is the same as AUPRC
+
+
+plt.figure(figsize=(8, 6))
+plt.plot(recall, precision, color='blue', lw=2, label=f'Precision-Recall curve (area = {prc_auc:.4f})')
+# Plot CI for PR curve. Need to re-sort recall for fill_between if interp1d didn't handle it
+# Use the common recall grid from bootstrap_results for plotting the CI bands
+plt.fill_between(bootstrap_results['mean_recall_for_interp'], bootstrap_results['precisions_lower'], bootstrap_results['precisions_upper'], color='grey', alpha=0.3, label='95% CI')
+
+
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('Precision-Recall Curve with 95% CI')
+plt.legend(loc="lower left")
+plt.grid(True)
+plt.show()
+
+
+# Confusion Matrix
+print("\n=== Confusion Matrix ===")
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(6, 5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Predicted Negative', 'Predicted Positive'], yticklabels=['Actual Negative', 'Actual Positive'])
+plt.xlabel('Predicted Label')
+plt.ylabel('True Label')
+plt.title('Confusion Matrix')
+plt.show()
+
+import shap
+import matplotlib.pyplot as plt
+
+
+# ==== SHAP Analysis ====
+print("\n=== SHAP Analysis ===")
+
+
+# Define a prediction function for SHAP
+def predict_proba_shap(texts):
+    model.eval()
+
+
+    encoded_input = base_tokenizer(
+        texts.tolist() if isinstance(texts, np.ndarray) else texts,
+        padding='max_length',
+        truncation=True,
+        max_length=MAX_LEN,
+        return_tensors='pt'
+    )
+
+
+    input_ids = encoded_input['input_ids'].to(device)
+    attention_mask = encoded_input['attention_mask'].to(device)
+
+
+    with torch.no_grad():
+        logits = model(input_ids, attention_mask)
+        probabilities = torch.sigmoid(logits).cpu().numpy()
+
+
+    # Single-output model → return probability of positive class
+    return probabilities.flatten()
+
+
+
+
+num_shap_samples = 50
+
+
+sampled_test_df_for_shap = test_df[test_df['proc_seq'].apply(lambda x: len(x) > 0)]
+if len(sampled_test_df_for_shap) > num_shap_samples:
+    shap_test_df = sampled_test_df_for_shap.sample(n=num_shap_samples, random_state=SEED)
+elif len(sampled_test_df_for_shap) > 0:
+    shap_test_df = sampled_test_df_for_shap
+else:
+    print("Not enough valid samples in test_df for SHAP analysis after filtering.")
+    shap_test_df = pd.DataFrame()
+
+
+if not shap_test_df.empty:
+    masker = shap.maskers.Text(tokenizer=base_tokenizer, mask_token='[MASK]')
+
+
+    explainer = shap.Explainer(
+        predict_proba_shap,
+        masker=masker
+    )
+
+
+    print(f"Generating SHAP values for {len(shap_test_df)} samples...")
+    shap_values = explainer(shap_test_df['proc_seq'].tolist())
+    print("SHAP values generated.")
+
+
+    print("\nSHAP Force Plots for selected test samples:")
+    for i in range(min(3, len(shap_test_df))):
+        print(f"Sample {i+1}: Original Label = {shap_test_df['label'].iloc[i]}")
+        shap.plots.force(shap_values[i], matplotlib=True)
+        plt.show()
+
+
+    print("\nSHAP Summary Plot:")
+    shap.summary_plot(
+        shap_values,
+        features=shap_test_df['proc_seq'].tolist(),
+        max_display=20
+    )
+    plt.show()
+
+
+    print("SHAP analysis completed.")
+else:
+    print("SHAP analysis skipped due to insufficient or invalid data.")
